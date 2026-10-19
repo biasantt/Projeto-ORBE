@@ -1,0 +1,232 @@
+#include <Wire.h>
+#include <Keypad.h>
+#include <LiquidCrystal_I2C.h>
+
+// LCD I2C: endereco usual 0x27
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Motor 28BYJ-48 + driver ULN2003
+const int IN1_PIN = 16;
+const int IN2_PIN = 17;
+const int IN3_PIN = 18;
+const int IN4_PIN = 19;
+
+// Sequencia de meio passo (half-step): 8 estados
+const byte SEQUENCIA[8][4] = {
+  {1, 0, 0, 0},
+  {1, 1, 0, 0},
+  {0, 1, 0, 0},
+  {0, 1, 1, 0},
+  {0, 0, 1, 0},
+  {0, 0, 1, 1},
+  {0, 0, 0, 1},
+  {1, 0, 0, 1}
+};
+
+int indiceSeq = 0;  // Estado atual da sequencia (0 a 7)
+
+// Teclado matricial 4x4
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+byte rowPins[ROWS] = {32, 33, 25, 26};
+byte colPins[COLS] = {27, 14, 13, 23};
+
+Keypad teclado = Keypad(
+  makeKeymap(keys), rowPins, colPins, ROWS, COLS
+);
+
+// 28BYJ-48 em meio passo: 4096 passos por volta
+const int PASSOS_VOLTA = 4096;
+const int PASSOS_FASE = PASSOS_VOLTA / 4;  // 1024
+
+// Atraso entre passos (us). Abaixo de ~1000 o motor perde passos.
+const unsigned int ATRASO_PASSO_US = 1500;
+
+// Desvio artificial (~5% da volta, como 10/200 no original)
+const int PASSOS_DESVIO = 205;
+
+const char* fases[4] = {
+  "Lua nova",
+  "Quarto crescente",
+  "Lua cheia",
+  "Quarto minguante"
+};
+
+int posicao = 0;       // Posicao comandada: 0 a 4095
+int faseAtual = 0;
+bool modoAutomatico = false;
+bool desvioAtivo = false;
+
+unsigned long ultimoPasso = 0;
+const unsigned long INTERVALO_AUTO_US = 2000;
+
+void energizarBobinas() {
+  digitalWrite(IN1_PIN, SEQUENCIA[indiceSeq][0]);
+  digitalWrite(IN2_PIN, SEQUENCIA[indiceSeq][1]);
+  digitalWrite(IN3_PIN, SEQUENCIA[indiceSeq][2]);
+  digitalWrite(IN4_PIN, SEQUENCIA[indiceSeq][3]);
+}
+
+void desligarBobinas() {
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, LOW);
+  digitalWrite(IN3_PIN, LOW);
+  digitalWrite(IN4_PIN, LOW);
+}
+
+// direcao > 0: horario | direcao < 0: anti-horario
+void darPasso(int direcao) {
+  indiceSeq += (direcao > 0) ? 1 : -1;
+
+  if (indiceSeq > 7) indiceSeq = 0;
+  if (indiceSeq < 0) indiceSeq = 7;
+
+  energizarBobinas();
+}
+
+void mostrarMensagem(const char* linha1, const char* linha2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(linha1);
+  lcd.setCursor(0, 1);
+  lcd.print(linha2);
+}
+
+void mostrarFase(int fase) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Fase da Lua:");
+
+  lcd.setCursor(0, 1);
+  lcd.print(fases[fase]);
+}
+
+void moverPassos(int quantidade) {
+  if (quantidade == 0) return;
+
+  int direcao = (quantidade > 0) ? 1 : -1;
+  int total = abs(quantidade);
+
+  for (int i = 0; i < total; i++) {
+    darPasso(direcao);
+    delayMicroseconds(ATRASO_PASSO_US);
+
+    posicao += direcao;
+
+    if (posicao >= PASSOS_VOLTA) posicao = 0;
+    if (posicao < 0) posicao = PASSOS_VOLTA - 1;
+  }
+
+  // Evita aquecimento quando parado
+  desligarBobinas();
+}
+
+void selecionarFase(int novaFase) {
+  modoAutomatico = false;
+  faseAtual = (novaFase + 4) % 4;
+
+  int destino = faseAtual * PASSOS_FASE;
+  int diferenca = destino - posicao;
+
+  // Escolhe o caminho mais curto na orbita
+  if (diferenca > PASSOS_VOLTA / 2) {
+    diferenca -= PASSOS_VOLTA;
+  }
+
+  if (diferenca < -PASSOS_VOLTA / 2) {
+    diferenca += PASSOS_VOLTA;
+  }
+
+  mostrarMensagem("Movendo para:", fases[faseAtual]);
+  moverPassos(diferenca);
+
+  desvioAtivo = false;
+  mostrarFase(faseAtual);
+}
+
+void provocarDesvio() {
+  // Deslocamento artificial
+  moverPassos(PASSOS_DESVIO);
+  desvioAtivo = true;
+
+  mostrarMensagem("Desvio simulado", "205 passos");
+}
+
+void iniciarAutomatico() {
+  modoAutomatico = !modoAutomatico;
+  ultimoPasso = micros();
+
+  if (modoAutomatico) {
+    mostrarMensagem("Modo automatico", "Em movimento");
+  } else {
+    desligarBobinas();
+    mostrarFase(faseAtual);
+  }
+}
+
+void atualizarAutomatico() {
+  if (!modoAutomatico) return;
+
+  if (micros() - ultimoPasso >= INTERVALO_AUTO_US) {
+    ultimoPasso = micros();
+
+    // Avanca continuamente na orbita
+    darPasso(1);
+
+    posicao++;
+    if (posicao >= PASSOS_VOLTA) posicao = 0;
+
+    // Cada quarto de volta representa uma fase
+    if (posicao % PASSOS_FASE == 0) {
+      faseAtual = posicao / PASSOS_FASE;
+      desvioAtivo = false;
+      mostrarFase(faseAtual);
+    }
+  }
+}
+
+void setup() {
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  pinMode(IN3_PIN, OUTPUT);
+  pinMode(IN4_PIN, OUTPUT);
+  desligarBobinas();
+
+  Wire.begin(21, 22);
+
+  lcd.init();
+  lcd.backlight();
+
+  mostrarMensagem("Simulador lunar", "Sistema pronto");
+}
+
+void loop() {
+  char tecla = teclado.getKey();
+
+  if (tecla == 'A') {
+    selecionarFase(faseAtual + 1);
+  }
+
+  if (tecla == 'B') {
+    selecionarFase(faseAtual - 1);
+  }
+
+  if (tecla == 'C') {
+    modoAutomatico = false;
+    provocarDesvio();
+  }
+
+  if (tecla == 'D') {
+    iniciarAutomatico();
+  }
+
+  atualizarAutomatico();
+}

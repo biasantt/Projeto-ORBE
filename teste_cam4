@@ -41,8 +41,8 @@
 #include <stdio.h>
 
 // ================== CONFIGURE AQUI ==================
-const char* WIFI_SSID  = "iPhone de Bianca";
-const char* WIFI_SENHA = "12345678";
+const char* WIFI_SSID  = "";
+const char* WIFI_SENHA = "";
 
 // Centro de rotação do objeto na imagem (QVGA = 320x240 -> centro é 160,120)
 const int CX = 160;

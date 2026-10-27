@@ -37,6 +37,13 @@ const byte SEQUENCIA[8][4] = {
 
 int indiceSeq = 0;
 
+// NOVO: o sentido POSITIVO do motor deve girar HORARIO (visto de cima).
+// O modo automatico e a tecla A usam o sentido positivo.
+// false: usa a sequencia como esta.
+// true : inverte a rotacao do motor.
+// Teste: aperte D e olhe de cima. Se girar anti-horario, troque para true.
+const bool INVERTER_DIRECAO = true;
+
 // 28BYJ-48 em meio passo: 4096 passos por volta
 const int PASSOS_VOLTA = 4096;
 const int PASSOS_FASE = PASSOS_VOLTA / 4;  // 1024
@@ -61,7 +68,7 @@ const unsigned long TEMPO_TELA_VELOCIDADE_MS = 900;
 // ==================== NOVO: COMUNICACAO COM A ESP32-CAM ====================
 // Canal Wi-Fi: o MESMO que a ESP32-CAM mostra no Serial Monitor
 // (e o canal do seu roteador). Deixe o canal do roteador FIXO, nao em "auto".
-const int CANAL_WIFI = 1;
+const int CANAL_WIFI = 6;
 
 // ==================== NOVO: CORRECAO DE DESVIO PELA CAMERA ====================
 // Erro (em graus) aceito como "alinhado"
@@ -267,9 +274,12 @@ void desligarBobinas() {
   digitalWrite(IN4_PIN, LOW);
 }
 
-// direcao > 0: sentido positivo | direcao < 0: sentido contrario
+// direcao > 0: sentido positivo (horario) | direcao < 0: sentido contrario
 void darPasso(int direcao) {
-  indiceSeq += (direcao > 0) ? 1 : -1;
+  // NOVO: inverte a rotacao fisica se INVERTER_DIRECAO = true
+  int dir = INVERTER_DIRECAO ? -direcao : direcao;
+
+  indiceSeq += (dir > 0) ? 1 : -1;
 
   if (indiceSeq > 7) indiceSeq = 0;
   if (indiceSeq < 0) indiceSeq = 7;
@@ -664,7 +674,7 @@ void atualizarAutomatico() {
   if (agoraUs - ultimoPassoAutoUs >= intervaloPassoAutoUs) {
     ultimoPassoAutoUs = agoraUs;
 
-    // Sentido positivo no modo automatico.
+    // Sentido positivo (horario) no modo automatico.
     darPasso(1);
 
     posicao++;

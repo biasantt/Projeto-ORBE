@@ -1,10 +1,14 @@
 /*
  * ESP32-CAM (AI Thinker) - Detecção de 4 posições (0, 90, 180, 270 graus)
  *
- * IDEIA: a câmera fica de cima, olhando para um objeto que gira em torno
- * de um ponto (CX, CY). O objeto tem UMA MARCA (adesivo/fita) perto da borda.
- * O código acha onde está a marca, calcula o ângulo dela em relação ao centro
- * e arredonda para o múltiplo de 90 graus mais próximo.
+ * IDEIA: a câmera fica de cima (22,5 cm de distância), olhando para um objeto
+ * que gira em torno de um ponto (CX, CY). A marca (adesivo/fita) fica a 8 cm
+ * do centro de rotação. O código acha onde está a marca, calcula o ângulo dela
+ * em relação ao centro e arredonda para o múltiplo de 90 graus mais próximo.
+ *
+ * GEOMETRIA (estimada, calibre com /foto):
+ *   OV2640 a 22,5 cm -> campo de ~23 x 17 cm -> ~14 px/cm em QVGA (320x240)
+ *   Raio de 8 cm -> ~112 px (a meia-altura da imagem é 120 px)
  *
  * INTEGRAÇÃO COM A ESP32 DO MOTOR (ESP-NOW):
  *   A cada leitura a câmera ENVIA o ângulo real da marca (0-360, horário,
@@ -17,7 +21,7 @@
  *   http://IP/         -> PÁGINA que mostra, ao vivo, a FASE mais próxima do objeto
  *   http://IP/posicao  -> JSON com a fase mais próxima, ângulo, desvio e pixels
  *   http://IP/foto     -> foto em cinza COM AS ANGULAÇÕES DESENHADAS:
- *        - anel de busca (dois círculos) e cruz no centro
+ *        - anel de busca (dois círculos), círculo fino de 8 cm e cruz no centro
  *        - linhas cheias nos ângulos 0, 90, 180, 270 com o número escrito
  *        - linhas pontilhadas em 45, 135, 225, 315 (limites entre posições)
  *        - uma linha do centro até a marca detectada + círculo sobre ela
@@ -48,14 +52,21 @@ const char* WIFI_SENHA = "";
 const int CX = 160;
 const int CY = 120;
 
-// Anel onde a marca pode aparecer (em pixels, a partir do centro)
-const int RAIO_MIN = 30;
-const int RAIO_MAX = 100;
+// Geometria física
+const float PX_POR_CM = 14.0;     // ~14 px/cm a 22,5 cm (calibre se precisar)
+const float RAIO_CM   = 8.0;      // raio da circunferência onde fica a marca
+const int RAIO_MARCA  = (int)(RAIO_CM * PX_POR_CM + 0.5f);   // ~112 px
+
+// Anel de busca ao redor de 8 cm (a imagem tem só 120 px de meia-altura)
+const int RAIO_MIN = 80;          // ~5,7 cm
+const int RAIO_MAX = 117;         // ~8,4 cm (limite da imagem)
 
 // Como a marca é vista
-const bool MARCA_ESCURA = true;   // true: marca escura em fundo claro | false: o contrário
+const bool MARCA_ESCURA = false;   // true: marca escura em fundo claro | false: o contrário
 const uint8_t LIMIAR    = 90;     // 0-255: separa "escuro" de "claro"
 const int MIN_PIXELS    = 15;     // mínimo de pixels para aceitar que achou a marca
+                                  // (a 14 px/cm, uma fita de 5 mm tem ~7 px de largura;
+                                  //  reduza se a marca for pequena)
 
 // Gira o "zero" se a posição 0 não estiver no sentido que você quer
 const float AJUSTE_ANGULO = 0.4;  // em graus
@@ -326,18 +337,19 @@ static void textoCentrado(camera_fb_t* fb, int cx, int cy, const char* s, int es
   texto(fb, x, y, s, escala);
 }
 
-// Anéis, cruz do centro e linhas de ângulo. Os ângulos "bruto" descontam o
-// AJUSTE_ANGULO, para que o "0" fique onde o código realmente considera 0.
+// Anéis, círculo de 8 cm, cruz do centro e linhas de ângulo. Os ângulos "bruto"
+// descontam o AJUSTE_ANGULO, para que o "0" fique onde o código realmente considera 0.
 static void desenharGuias(camera_fb_t* fb, uint8_t cor, int esp) {
   circulo(fb, CX, CY, RAIO_MIN, cor, esp);
   circulo(fb, CX, CY, RAIO_MAX, cor, esp);
+  circulo(fb, CX, CY, RAIO_MARCA, cor, 1);   // referência: onde a marca deve passar (8 cm)
   for (int i = -6; i <= 6; i++) {
     ponto(fb, CX + i, CY, cor, esp);
     ponto(fb, CX, CY + i, cor, esp);
   }
   for (int k = 0; k < 4; k++) {
     // linha cheia: 0, 90, 180, 270
-    linhaPolar(fb, k * 90 - AJUSTE_ANGULO, RAIO_MIN, RAIO_MAX + 8, cor, esp, 1);
+    linhaPolar(fb, k * 90 - AJUSTE_ANGULO, RAIO_MIN, RAIO_MAX, cor, esp, 1);
     // pontilhada: 45, 135, 225, 315 (onde a posição "vira")
     linhaPolar(fb, k * 90 + 45 - AJUSTE_ANGULO, RAIO_MIN, RAIO_MAX, cor, esp, 4);
   }
@@ -431,12 +443,12 @@ static esp_err_t rotaFoto(httpd_req_t* req) {
     if (achou) desenharMarca(fb, mx, my, cor, esp);
   }
 
-  // 3) Números dos ângulos fora do anel (0 = cima, 90 = direita, ...)
+  // 3) Números dos ângulos POR DENTRO do anel (fora dele não cabe na imagem)
   char buf[24];
   for (int k = 0; k < 4; k++) {
     float bruto = k * 90 - AJUSTE_ANGULO;
     float r = bruto * PI / 180.0f;
-    float d = RAIO_MAX + 24;
+    float d = RAIO_MIN - 18;
     snprintf(buf, sizeof(buf), "%d`", k * 90);
     textoCentrado(fb, CX + (int)lroundf(d * sinf(r)), CY - (int)lroundf(d * cosf(r)), buf, 2);
   }
@@ -554,5 +566,5 @@ void loop() {
     Serial.printf("Posição: %s | ângulo %.1f | pixels %d\n",
                   melhor >= 0 ? NOMES[melhor] : "nao detectado", (float)ultimoAngulo, px);
   }
-  delay(40);                                  // (era 100) leituras mais rápidas para o controle
+  delay(40);                                  // leituras rápidas para o controle
 }

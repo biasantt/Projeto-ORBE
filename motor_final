@@ -88,7 +88,11 @@ const unsigned long TIMEOUT_CORRECAO_MS = 4000;
 
 // true : passo POSITIVO do motor aumenta o angulo da camera (sentido horario visto de cima)
 // false: o contrario. Se a correcao PIORAR o erro, troque este valor.
-const bool SENTIDO_POSITIVO_E_HORARIO = true;
+// A câmera usa ângulo crescente no sentido ANTI-HORÁRIO.
+// Como o passo positivo do motor foi configurado como HORÁRIO,
+// um movimento positivo do motor DIMINUI o ângulo medido pela câmera.
+// Portanto, a correção precisa inverter o sinal do erro.
+const bool SENTIDO_POSITIVO_E_HORARIO = false;
 
 // ==================== TECLADO 4x4 ====================
 const byte ROWS = 4;
@@ -156,7 +160,8 @@ volatile uint32_t tRecebidoMs = 0;   // quando chegou o ultimo pacote
 volatile uint32_t nPacotes = 0;      // quantos pacotes ja chegaram
 
 int faseAlvo = 0;                    // fase que o objeto DEVE estar (a camera confere)
-bool correcaoAutomatica = true;      // corrige sozinho apos mover/desvio
+bool correcaoHabilitada = true;      // tecla 5: permite/bloqueia qualquer correcao
+bool correcaoAutomatica = true;      // tecla 2: corrige automaticamente apos mover/desvio
 bool corrigindo = false;
 int tentativaAtual = 0;
 float erroAnterior = 0;
@@ -381,6 +386,13 @@ void mostrarCorrecao(int tentativa, float erro) {
 }
 
 void iniciarCorrecao() {
+  if (!correcaoHabilitada) {
+    mostrarMensagem("Correcao", "DESABILITADA");
+    delay(700);
+    mostrarFase(faseAtual);
+    return;
+  }
+
   if (modoAutomatico) {
     mostrarMensagem("Desligue o auto", "(tecla D)");
     return;
@@ -506,18 +518,36 @@ void mostrarStatusCamera() {
   mostrarMensagem(l1, l2);
 }
 
-// Tecla 2: liga/desliga a correcao automatica
+// Tecla 5: habilita/desabilita TODO o sistema de correcao da camera.
+// Quando desabilitada, nem a correcao automatica nem a manual (tecla 1)
+// podem movimentar o motor para corrigir a fase.
+void alternarCorrecaoHabilitada() {
+  correcaoHabilitada = !correcaoHabilitada;
+
+  if (!correcaoHabilitada) {
+    corrigindo = false;  // cancela uma verificacao/correcao pendente
+  }
+
+  mostrarMensagem(
+    "Correcao fase:",
+    correcaoHabilitada ? "HABILITADA" : "DESABILITADA"
+  );
+  delay(900);
+  mostrarFase(faseAtual);
+}
+
+// Tecla 2: liga/desliga somente a correcao automatica.
+// A tecla 5 e a chave geral que permite ou bloqueia qualquer correcao.
 void alternarCorrecaoAutomatica() {
   correcaoAutomatica = !correcaoAutomatica;
 
   mostrarMensagem(
-    "Correcao auto:",
+    "Auto correcao:",
     correcaoAutomatica ? "LIGADA" : "DESLIGADA"
   );
   delay(800);
   mostrarFase(faseAtual);
 }
-
 // ======================================================
 // SELECAO MANUAL DAS FASES
 // ======================================================
@@ -558,7 +588,7 @@ void selecionarFase(int novaFase) {
   mostrarFase(faseAtual);
 
   // NOVO: confere com a camera (so se ela estiver enviando; senao segue normal)
-  if (correcaoAutomatica && cameraAtiva()) {
+  if (correcaoHabilitada && correcaoAutomatica && cameraAtiva()) {
     iniciarCorrecao();
   }
 }
@@ -584,7 +614,7 @@ void provocarDesvio() {
   mostrarMensagem("Desvio simulado", "205 passos");
 
   // NOVO: a camera detecta o desvio e o motor corrige
-  if (correcaoAutomatica) {
+  if (correcaoHabilitada && correcaoAutomatica) {
     delay(1200);
     iniciarCorrecao();
   }
@@ -792,6 +822,9 @@ void loop() {
   }
   else if (tecla == '2') {
     alternarCorrecaoAutomatica();  // NOVO: liga/desliga a correcao automatica
+  }
+  else if (tecla == '5') {
+    alternarCorrecaoHabilitada();  // chave geral da correcao de fase
   }
   else if (tecla == '0') {
     mostrarStatusCamera();     // NOVO: mostra o angulo que a camera esta vendo

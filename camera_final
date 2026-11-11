@@ -2,35 +2,32 @@
  * ESP32-CAM (AI Thinker) - Detecção de 4 posições (0, 90, 180, 270 graus)
  *
  * IDEIA: a câmera fica de cima (22,5 cm de distância), olhando para um objeto
- * que gira em torno de um ponto (CX, CY). A marca (adesivo/fita) fica a 8 cm
- * do centro de rotação. O código acha onde está a marca, calcula o ângulo dela
- * em relação ao centro e arredonda para o múltiplo de 90 graus mais próximo.
+ * que gira em torno de um ponto (CX, CY). A LUA (esfera pequena na haste) fica
+ * a 8 cm do centro de rotação. A TERRA (esfera grande, no centro) é IGNORADA
+ * por tamanho: o código separa a imagem em manchas claras conectadas (blobs)
+ * e só aceita a mancha com tamanho de Lua.
  *
  * GEOMETRIA (estimada, calibre com /foto):
  *   OV2640 a 22,5 cm -> campo de ~23 x 17 cm -> ~14 px/cm em QVGA (320x240)
  *   Raio de 8 cm -> ~112 px (a meia-altura da imagem é 120 px)
  *
  * INTEGRAÇÃO COM A ESP32 DO MOTOR (ESP-NOW):
- *   A cada leitura a câmera ENVIA o ângulo real da marca (0-360, horário,
- *   0 = fase NOVA) para a ESP32 do motor, que usa isso para corrigir o desvio.
+ *   A cada leitura a câmera ENVIA o ângulo real da Lua (0-360) para a
+ *   ESP32 do motor. Convenção: 0 = ESQUERDA (NOVA), 90 = BAIXO
+ *   (CRESCENTE), 180 = DIREITA (CHEIA), 270 = CIMA (MINGUANTE).
+ *   O ângulo cresce no sentido anti-horário visto pela câmera.
  *   O ESP-NOW usa o MESMO canal Wi-Fi do roteador. O canal aparece no Serial
  *   ao iniciar: coloque esse número em CANAL_WIFI no sketch do motor.
  *   (Requer Arduino-ESP32 core 3.x)
  *
  * Rotas:
- *   http://IP/         -> PÁGINA que mostra, ao vivo, a FASE mais próxima do objeto
+ *   http://IP/         -> PÁGINA que mostra, ao vivo, a FASE mais próxima
  *   http://IP/posicao  -> JSON com a fase mais próxima, ângulo, desvio e pixels
- *   http://IP/foto     -> foto em cinza COM AS ANGULAÇÕES DESENHADAS:
- *        - anel de busca (dois círculos), círculo fino de 8 cm e cruz no centro
- *        - linhas cheias nos ângulos 0, 90, 180, 270 com o número escrito
- *        - linhas pontilhadas em 45, 135, 225, 315 (limites entre posições)
- *        - uma linha do centro até a marca detectada + círculo sobre ela
- *        - canto superior esquerdo: ângulo medido, posição arredondada e
- *          o desvio em relação a ela (ex.: +3.4 = 3,4 graus passou do alvo)
+ *   http://IP/foto     -> foto em cinza COM AS ANGULAÇÕES DESENHADAS
  *
- * Fases: 0 = NOVA (marca para CIMA), 1 = CRESCENTE (DIREITA),
- *        2 = CHEIA (BAIXO), 3 = MINGUANTE (ESQUERDA)
- * (sentido horário, visto pela câmera)
+ * Fases e ângulos: 0 = NOVA (ESQUERDA), 90 = CRESCENTE (BAIXO),
+ *                  180 = CHEIA (DIREITA), 270 = MINGUANTE (CIMA).
+ * O ângulo cresce no sentido anti-horário, visto pela câmera.
  */
 
 #include "esp_camera.h"
@@ -43,10 +40,15 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <ArduinoOTA.h>
 
 // ================== CONFIGURE AQUI ==================
-const char* WIFI_SSID  = "";
-const char* WIFI_SENHA = "";
+const char* WIFI_SSID  = "iPhone de Bianca";
+const char* WIFI_SENHA = "12345678";
+
+// Atualização pelo ar (OTA). Deixe a senha vazia ("") para não usar senha.
+const char* OTA_NOME  = "esp32cam-lua";
+const char* OTA_SENHA = "";
 
 // Centro de rotação do objeto na imagem (QVGA = 320x240 -> centro é 160,120)
 const int CX = 160;
@@ -54,22 +56,30 @@ const int CY = 120;
 
 // Geometria física
 const float PX_POR_CM = 14.0;     // ~14 px/cm a 22,5 cm (calibre se precisar)
-const float RAIO_CM   = 8.0;      // raio da circunferência onde fica a marca
+const float RAIO_CM   = 8.0;      // raio da órbita da Lua
 const int RAIO_MARCA  = (int)(RAIO_CM * PX_POR_CM + 0.5f);   // ~112 px
 
-// Anel de busca ao redor de 8 cm (a imagem tem só 120 px de meia-altura)
+// Anel só para DESENHAR as guias em /foto
 const int RAIO_MIN = 80;          // ~5,7 cm
 const int RAIO_MAX = 117;         // ~8,4 cm (limite da imagem)
 
+// Onde a LUA pode estar (distância do centro, em px). Perto de 8 cm = ~112 px.
+// Como ela fica na borda da imagem, aceite uma faixa larga.
+const int RAIO_ACEITO_MIN = 60;
+const int RAIO_ACEITO_MAX = 170;
+
 // Como a marca é vista
-const bool MARCA_ESCURA = false;   // true: marca escura em fundo claro | false: o contrário
-const uint8_t LIMIAR    = 90;     // 0-255: separa "escuro" de "claro"
-const int MIN_PIXELS    = 15;     // mínimo de pixels para aceitar que achou a marca
-                                  // (a 14 px/cm, uma fita de 5 mm tem ~7 px de largura;
-                                  //  reduza se a marca for pequena)
+const bool MARCA_ESCURA = false;  // Lua clara
+const uint8_t LIMIAR    = 140;    // suba (ex.: 140-160) se a Lua grudar na Terra
+
+// Tamanho aceito para a Lua, em pixels da imagem 320x240.
+// Lua ~ raio 15-20 px => ~700-1300 px. Terra ~ 20000+ px => rejeitada.
+const int AREA_MIN_PX = 60;       // mínimo (a Lua pode estar cortada pela borda)
+const int AREA_MAX_PX = 9000;     // máximo: acima disso é a Terra (~17000 px)
+const int DIM_MAX_PX  = 100;      // maior lado da caixa da mancha (Terra tem ~150)
 
 // Gira o "zero" se a posição 0 não estiver no sentido que você quer
-const float AJUSTE_ANGULO = 0.4;  // em graus
+const float AJUSTE_ANGULO = 0.5;  // em graus
 // ====================================================
 
 // Pinos - AI Thinker
@@ -91,18 +101,17 @@ const float AJUSTE_ANGULO = 0.4;  // em graus
 #define PCLK_GPIO_NUM     22
 #define LED_FLASH_GPIO     4
 
-// Fases da Lua, na ordem do ciclo (sentido horário visto pela câmera):
-//   0 = Nova (0°) -> 1 = Crescente (90°) -> 2 = Cheia (180°) -> 3 = Minguante (270°)
+// Fases da Lua, na ordem do ciclo (sentido horário visto pela câmera)
 const char* NOMES[4] = {"NOVA (0)", "CRESCENTE (90)", "CHEIA (180)", "MINGUANTE (270)"};
 
 // ---------- Pacote enviado para a ESP32 do motor ----------
 // (a mesma struct precisa existir, idêntica, no sketch do motor)
 typedef struct __attribute__((packed)) {
   uint8_t  magic;    // 0xA5 - identifica que o pacote é nosso
-  uint8_t  valido;   // 1 = marca encontrada e leitura estável
+  uint8_t  valido;   // 1 = Lua encontrada e leitura estável
   uint16_t seq;      // contador de pacotes
-  float    angulo;   // 0-360, horário, 0 = cima (fase NOVA)
-  uint16_t pixels;   // quantidade de pixels da marca
+  float    angulo;   // 0-360: 0=esquerda, 90=baixo, 180=direita, 270=cima
+  uint16_t pixels;   // área da mancha da Lua em pixels
 } PacoteAngulo;
 
 // Broadcast: não precisa saber o MAC da outra placa
@@ -116,9 +125,10 @@ volatile int   ultimosPixels  = 0;
 // Fase (0-3) MAIS PRÓXIMA do ângulo medido, atualizada a cada leitura válida
 volatile int   proximaFase    = -1;     // -1 = ainda não leu nada
 volatile float desvioFase     = 0;      // graus até essa fase (-45 a +45; + = passou, - = falta)
-volatile bool  detectadoAgora = false;  // a marca foi vista na leitura mais recente?
+volatile bool  detectadoAgora = false;  // a Lua foi vista na leitura mais recente?
 
 httpd_handle_t servidor = NULL;
+bool cameraOk = false;
 
 // ---------- Câmera em ESCALA DE CINZA (1 byte por pixel, fácil de analisar) ----------
 bool iniciarCamera() {
@@ -150,45 +160,105 @@ bool iniciarCamera() {
 }
 
 // ---------- Detecção ----------
-// Analisa um quadro JÁ CAPTURADO. Retorna true se achou a marca.
-//   angulo   : 0-360, horário, 0 = cima (já com AJUSTE_ANGULO)
-//   pixels   : quantos pixels da marca foram encontrados
-//   mx, my   : posição da marca em pixels, relativa ao centro (x p/ direita, y p/ baixo)
+
+// Buffers de trabalho (meia resolução: 160x120)
+static uint8_t*  mascara = NULL;
+static uint16_t* fila    = NULL;
+
+static bool prepararBuffers(int n2) {
+  if (mascara && fila) return true;
+  mascara = (uint8_t*)  (psramFound() ? ps_malloc(n2)     : malloc(n2));
+  fila    = (uint16_t*) (psramFound() ? ps_malloc(n2 * 2) : malloc(n2 * 2));
+  return mascara && fila;
+}
+
+// Analisa um quadro JÁ CAPTURADO. Retorna true se achou a Lua.
+// Separa a imagem em manchas claras e escolhe só a que tem tamanho de Lua
+// (a Terra, muito maior, é descartada).
+//   angulo   : 0-360, anti-horário: 0=esquerda, 90=baixo, 180=direita, 270=cima
+//   pixels   : área da mancha escolhida (em px da imagem original)
+//   mx, my   : posição da Lua em pixels, relativa ao centro (x p/ direita, y p/ baixo)
 bool analisarFrame(camera_fb_t* fb, float &angulo, int &pixels, float &mx, float &my) {
   pixels = 0;
   const int w = fb->width, h = fb->height;
-  const long r2min = (long)RAIO_MIN * RAIO_MIN;
-  const long r2max = (long)RAIO_MAX * RAIO_MAX;
+  const int w2 = w / 2, h2 = h / 2, n2 = w2 * h2;
+  if (!prepararBuffers(n2)) return false;
 
-  long somaX = 0, somaY = 0;
-  int n = 0;
-
-  for (int y = 0; y < h; y += 2) {            // pula de 2 em 2 para ser mais rápido
-    for (int x = 0; x < w; x += 2) {
-      int dx = x - CX, dy = y - CY;
-      long d2 = (long)dx * dx + (long)dy * dy;
-      if (d2 < r2min || d2 > r2max) continue; // fora do anel: ignora
-
-      uint8_t v = fb->buf[y * w + x];
+  // 1) Máscara binária em meia resolução (1 = candidato, 0 = fundo)
+  for (int y = 0; y < h2; y++) {
+    for (int x = 0; x < w2; x++) {
+      uint8_t v = fb->buf[(y * 2) * w + (x * 2)];
       bool marcado = MARCA_ESCURA ? (v < LIMIAR) : (v > LIMIAR);
-      if (marcado) { somaX += dx; somaY += dy; n++; }
+      mascara[y * w2 + x] = marcado ? 1 : 0;
     }
   }
 
-  pixels = n;
-  if (n < MIN_PIXELS) return false;
+  // 2) Rotula manchas (flood fill 4-vizinhos) e guarda a melhor candidata
+  float melhorScore = -1e9f;
+  bool achou = false;
+  float melhorX = 0, melhorY = 0;
+  int melhorArea = 0;
 
-  // Centro de massa da marca, relativo ao centro de rotação
-  mx = (float)somaX / n;
-  my = (float)somaY / n;
+  for (int i0 = 0; i0 < n2; i0++) {
+    if (mascara[i0] != 1) continue;
 
-  // Na imagem, Y cresce para baixo, então "cima" = -my.
-  // atan2(x, cima) dá 0° para cima e cresce no sentido horário.
-  float a = atan2f(mx, -my) * 180.0f / PI;
-  a += AJUSTE_ANGULO;
+    int ini = 0, fim = 0;
+    fila[fim++] = i0;
+    mascara[i0] = 2;                       // 2 = já visitado
+
+    long area = 0, somaX = 0, somaY = 0;
+    int minX = w2, maxX = 0, minY = h2, maxY = 0;
+
+    while (ini < fim) {
+      int idx = fila[ini++];
+      int x = idx % w2, y = idx / w2;
+      area++;
+      somaX += x; somaY += y;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+
+      if (x > 0      && mascara[idx - 1]  == 1) { mascara[idx - 1]  = 2; fila[fim++] = idx - 1; }
+      if (x < w2 - 1 && mascara[idx + 1]  == 1) { mascara[idx + 1]  = 2; fila[fim++] = idx + 1; }
+      if (y > 0      && mascara[idx - w2] == 1) { mascara[idx - w2] = 2; fila[fim++] = idx - w2; }
+      if (y < h2 - 1 && mascara[idx + w2] == 1) { mascara[idx + w2] = 2; fila[fim++] = idx + w2; }
+    }
+
+    // Filtros: tamanho (área em px originais = área*4) e dimensão da caixa
+    int areaPx = (int)(area * 4);
+    int dimPx  = max(maxX - minX + 1, maxY - minY + 1) * 2;
+    if (areaPx < AREA_MIN_PX || areaPx > AREA_MAX_PX) continue;   // Terra cai aqui
+    if (dimPx > DIM_MAX_PX) continue;
+
+    // Centro da mancha relativo ao centro de rotação (coordenadas originais)
+    float cx = (float)somaX / area * 2.0f - CX;
+    float cy = (float)somaY / area * 2.0f - CY;
+    float dist = sqrtf(cx * cx + cy * cy);
+    if (dist < RAIO_ACEITO_MIN || dist > RAIO_ACEITO_MAX) continue;
+
+    // Prefere a mancha maior e mais perto de onde a Lua deveria estar (8 cm)
+    float score = areaPx - 3.0f * fabsf(dist - RAIO_MARCA);
+    if (score > melhorScore) {
+      melhorScore = score;
+      melhorX = cx; melhorY = cy;
+      melhorArea = areaPx;
+      achou = true;
+    }
+  }
+
+  if (!achou) return false;
+
+  mx = melhorX;
+  my = melhorY;
+  pixels = melhorArea;
+
+  // Convenção do projeto: 0° = ESQUERDA, 90° = BAIXO,
+  // 180° = DIREITA, 270° = CIMA. O ângulo cresce anti-horário.
+  float bruto = atan2f(mx, -my) * 180.0f / PI;
+  float a = 270.0f - bruto + AJUSTE_ANGULO;
   while (a < 0)    a += 360;
   while (a >= 360) a -= 360;
-
   angulo = a;
   return true;
 }
@@ -337,25 +407,31 @@ static void textoCentrado(camera_fb_t* fb, int cx, int cy, const char* s, int es
   texto(fb, x, y, s, escala);
 }
 
+// Converte um ângulo do projeto (0 = esquerda, 90 = baixo, ...) para o ângulo
+// bruto da imagem (0 = cima, horário), para desenhar no lugar certo.
+static float brutoDoAngulo(float projeto) {
+  return 270.0f - projeto + AJUSTE_ANGULO;
+}
+
 // Anéis, círculo de 8 cm, cruz do centro e linhas de ângulo. Os ângulos "bruto"
 // descontam o AJUSTE_ANGULO, para que o "0" fique onde o código realmente considera 0.
 static void desenharGuias(camera_fb_t* fb, uint8_t cor, int esp) {
   circulo(fb, CX, CY, RAIO_MIN, cor, esp);
   circulo(fb, CX, CY, RAIO_MAX, cor, esp);
-  circulo(fb, CX, CY, RAIO_MARCA, cor, 1);   // referência: onde a marca deve passar (8 cm)
+  circulo(fb, CX, CY, RAIO_MARCA, cor, 1);   // referência: órbita da Lua (8 cm)
   for (int i = -6; i <= 6; i++) {
     ponto(fb, CX + i, CY, cor, esp);
     ponto(fb, CX, CY + i, cor, esp);
   }
   for (int k = 0; k < 4; k++) {
     // linha cheia: 0, 90, 180, 270
-    linhaPolar(fb, k * 90 - AJUSTE_ANGULO, RAIO_MIN, RAIO_MAX, cor, esp, 1);
+    linhaPolar(fb, brutoDoAngulo(k * 90), RAIO_MIN, RAIO_MAX, cor, esp, 1);
     // pontilhada: 45, 135, 225, 315 (onde a posição "vira")
-    linhaPolar(fb, k * 90 + 45 - AJUSTE_ANGULO, RAIO_MIN, RAIO_MAX, cor, esp, 4);
+    linhaPolar(fb, brutoDoAngulo(k * 90 + 45), RAIO_MIN, RAIO_MAX, cor, esp, 4);
   }
 }
 
-// Linha do centro até a marca + círculo em volta dela
+// Linha do centro até a Lua + círculo em volta dela
 static void desenharMarca(camera_fb_t* fb, float mx, float my, uint8_t cor, int esp) {
   float bruto = atan2f(mx, -my) * 180.0f / PI;
   float comp  = sqrtf(mx * mx + my * my);
@@ -411,7 +487,7 @@ async function atualizar(){
     const f=document.getElementById('fase'), i=document.getElementById('info');
     if(d.fase_mais_proxima<0){f.textContent='Sem leitura';i.textContent='';return;}
     f.textContent=d.nome;
-    i.textContent=(d.detectado?'':'(marca perdida - ultimo valor) ')+
+    i.textContent=(d.detectado?'':'(Lua perdida - ultimo valor) ')+
       '\u00C2ngulo: '+d.angulo.toFixed(1)+'\u00B0 | Desvio: '+
       (d.desvio>=0?'+':'')+d.desvio.toFixed(1)+'\u00B0 | Pixels: '+d.pixels;
   }catch(e){}
@@ -424,7 +500,7 @@ static esp_err_t rotaInicio(httpd_req_t* req) {
   return httpd_resp_send(req, PAGINA, HTTPD_RESP_USE_STRLEN);
 }
 
-// Foto em cinza com anel, ângulos e marca detectada desenhados
+// Foto em cinza com anel, ângulos e Lua detectada desenhados
 static esp_err_t rotaFoto(httpd_req_t* req) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
@@ -435,7 +511,6 @@ static esp_err_t rotaFoto(httpd_req_t* req) {
   bool achou = analisarFrame(fb, ang, px, mx, my);
 
   // 2) Desenha em duas passadas: contorno preto grosso e depois linha branca fina.
-  //    Assim as marcações aparecem tanto em fundo claro quanto escuro.
   for (int passada = 0; passada < 2; passada++) {
     uint8_t cor = (passada == 0) ? 0 : 255;
     int esp     = (passada == 0) ? 3 : 1;
@@ -446,7 +521,7 @@ static esp_err_t rotaFoto(httpd_req_t* req) {
   // 3) Números dos ângulos POR DENTRO do anel (fora dele não cabe na imagem)
   char buf[24];
   for (int k = 0; k < 4; k++) {
-    float bruto = k * 90 - AJUSTE_ANGULO;
+    float bruto = brutoDoAngulo(k * 90);
     float r = bruto * PI / 180.0f;
     float d = RAIO_MIN - 18;
     snprintf(buf, sizeof(buf), "%d`", k * 90);
@@ -467,7 +542,7 @@ static esp_err_t rotaFoto(httpd_req_t* req) {
     snprintf(buf, sizeof(buf), "%+.1f", desvio);
     texto(fb, 5, 45, buf, 2);
   } else {
-    texto(fb, 5, 5, "---", 2);                // marca não encontrada
+    texto(fb, 5, 5, "---", 2);                // Lua não encontrada
   }
 
   uint8_t* jpg = NULL;
@@ -501,10 +576,8 @@ void setup() {
   pinMode(LED_FLASH_GPIO, OUTPUT);
   digitalWrite(LED_FLASH_GPIO, LOW);   // dica: luz constante ajuda MUITO a detecção
 
-  if (!iniciarCamera()) {
-    Serial.println("Falha na câmera.");
-    return;
-  }
+  cameraOk = iniciarCamera();
+  if (!cameraOk) Serial.println("Falha na câmera (o OTA continua disponível).");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_SENHA);
@@ -517,9 +590,19 @@ void setup() {
   if (!iniciarEspNow()) Serial.println("Falha ao iniciar ESP-NOW.");
 
   iniciarServidor();
+
+  // OTA: depois desta versão estar gravada, as próximas podem ser enviadas
+  // pelo Wi-Fi (Ferramentas > Porta > esp32cam-lua), sem ligar o IO0 no GND.
+  ArduinoOTA.setHostname(OTA_NOME);
+  if (strlen(OTA_SENHA) > 0) ArduinoOTA.setPassword(OTA_SENHA);
+  ArduinoOTA.begin();
+  Serial.println("OTA pronto.");
 }
 
 void loop() {
+  ArduinoOTA.handle();                        // atende atualizações pelo Wi-Fi
+  if (!cameraOk) { delay(100); return; }
+
   // Votação: guarda as últimas 5 leituras e usa a mais frequente.
   // Isso evita que uma leitura ruim (sombra, reflexo) mude a posição.
   static int historico[5] = {-1, -1, -1, -1, -1};
@@ -557,8 +640,8 @@ void loop() {
 
   int votos[4] = {0, 0, 0, 0};
   for (int i = 0; i < 5; i++) if (historico[i] >= 0) votos[historico[i]]++;
-  int melhor = -1, max = 2;                   // precisa de pelo menos 3 votos de 5
-  for (int p = 0; p < 4; p++) if (votos[p] > max) { max = votos[p]; melhor = p; }
+  int melhor = -1, maxVotos = 2;              // precisa de pelo menos 3 votos de 5
+  for (int p = 0; p < 4; p++) if (votos[p] > maxVotos) { maxVotos = votos[p]; melhor = p; }
   posicaoEstavel = melhor;
 
   if (melhor != ultimaImpressa) {
